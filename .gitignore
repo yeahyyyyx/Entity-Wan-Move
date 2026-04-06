@@ -1,8 +1,9 @@
-.gradio/
-__pycache__/
-gradio_results/
-Wan-Move-14B-480P/
-
-*.whl
-example*
-*.bash
+**/__pycache__/
+*.pyc
+*.egg-info/
+.ipynb_checkpoints/
+data/
+MoveBench/
+results/
+*.mp4
+*.npy
