@@ -430,6 +430,39 @@ def _postprocess_tracks(x1: np.ndarray, y1: np.ndarray, x2: np.ndarray, y2: np.n
     return x1, y1, x2, y2
 
 
+def _apply_min_separation(
+    x1: np.ndarray,
+    y1: np.ndarray,
+    x2: np.ndarray,
+    y2: np.ndarray,
+    mid: int,
+    hold: int,
+    min_sep: float,
+    rng: np.random.Generator,
+):
+    """Ensure that during a hold window, the two trajectories are not exactly identical.
+
+    Reviewer-facing: avoid ill-posed "perfect merge for many frames".
+    We keep a tiny offset (>=min_sep) to simulate partial occlusion rather than singularity.
+
+    Only used in non-hard modes / non-cross single-frame events.
+    """
+    if hold <= 1 or min_sep <= 0:
+        return
+
+    T = len(x1)
+    span = hold // 2
+    s0, s1 = max(0, mid - span), min(T, mid + span + 1)
+
+    # random offset direction, constant over the window
+    ang = float(rng.uniform(0, 2 * np.pi))
+    dx = float(np.cos(ang) * min_sep)
+    dy = float(np.sin(ang) * min_sep)
+
+    x2[s0:s1] = x2[s0:s1] + dx
+    y2[s0:s1] = y2[s0:s1] + dy
+
+
 def _clamp_tracks(tr1: np.ndarray, tr2: np.ndarray, x_min=0.05, x_max=0.95, y_min=0.45, y_max=0.88):
     """Final clamp to safe region."""
     tr1[:, 0] = np.clip(tr1[:, 0], x_min, x_max)
@@ -448,6 +481,8 @@ def make_tracks(
     stress_mode: str = "none",
     overlap_frames: int = 9,
     smooth_window: int = 4,
+    min_separation_px: float = 3.0,
+    track_noise_std: float = 0.006,
 ) -> Tracks:
     """Generate trajectories.
 
@@ -464,6 +499,12 @@ def make_tracks(
     overlap_frames = int(max(1, min(NUM_FRAMES, overlap_frames)))
     if overlap_frames % 2 == 0:
         overlap_frames += 1
+
+    smooth_window = int(max(0, smooth_window))
+    min_separation_px = float(max(0.0, min_separation_px))
+    # convert pixel separation to normalized units (roughly isotropic)
+    min_sep = float(min_separation_px / max(W, H))
+    track_noise_std = float(max(0.0, track_noise_std))
 
     # keep trajectories in floor region (avoid hitting y clamp ceiling)
     y_center = rng.uniform(0.58, 0.68)
@@ -518,6 +559,8 @@ def make_tracks(
             ramp = smooth_window
 
         _apply_overlap_event(x1, y1, x2, y2, mid, x_ov, y_ov, hold=hold, ramp=ramp)
+        # In default mode hold=1; in hard mode allow perfect overlap.
+        # For cross in default mode, hold=1 so no singularity; in hard mode we allow perfect overlap on purpose.
 
     elif task == "parallel":
         # guarantee PARALLEL happens (never cross / never occlude):
@@ -590,6 +633,9 @@ def make_tracks(
         hold = overlap_frames if stress_mode == "hard" else 3
         ramp = max(smooth_window, hold // 2) if smooth_window > 0 else 0
         _apply_overlap_event(x_m, y_m, x_m, y_m, mid, x0, y0, hold=hold, ramp=ramp)
+        # Avoid ill-posed multi-frame perfect merge in default mode
+        if stress_mode != "hard":
+            _apply_min_separation(x1, y1, x_m, y_m, mid=mid, hold=hold, min_sep=min_sep, rng=rng)
 
         # write back
         x2, y2 = x_m, y_m
@@ -679,6 +725,18 @@ def make_tracks(
             x2[s0:s1] = x_mid
             y1[s0:s1] = y_mid
             y2[s0:s1] = y_mid
+
+    # Add mild asymmetry / realism noise (low amplitude) AFTER events.
+    # Use low-frequency noise so it doesn't look like pixel jitter.
+    if track_noise_std > 0 and stress_mode != "hard":
+        jx1 = _smooth_noise(rng, t, amp=track_noise_std * float(rng.uniform(0.6, 1.1)))
+        jy1 = _smooth_noise(rng, t, amp=track_noise_std * float(rng.uniform(0.6, 1.1)))
+        jx2 = _smooth_noise(rng, t, amp=track_noise_std * float(rng.uniform(0.6, 1.1)))
+        jy2 = _smooth_noise(rng, t, amp=track_noise_std * float(rng.uniform(0.6, 1.1)))
+        x1 = x1 + jx1
+        y1 = y1 + jy1
+        x2 = x2 + jx2
+        y2 = y2 + jy2
 
     tr1 = np.stack([x1, y1], 1)
     tr2 = np.stack([x2, y2], 1)
@@ -816,33 +874,60 @@ def draw_arrow(img: np.ndarray, center: Tuple[int, int], r: int, color_bgr, angl
 # ----------------------------
 
 def object_specs(task: str, obj_type: str, case_id: int, variant_id: int):
-    """Return specs for Object A (track1) and Object B (track2). Deterministic."""
+    """Return specs for Object A (track1) and Object B (track2). Deterministic.
+
+    Note: specs may include optional keys:
+      - material: "metal" | "plastic" (used mainly for prompt semantics)
+    """
 
     if task == "attribute_confusion":
-        # keep the killer definition explicit
-        # sphere-type focuses on circle vs ellipse
+        # Strengthened killer: mix several "semantic-close + visual-conflict" presets.
+        # We keep it deterministic by variant_id.
         rng = seeded_rng("attr", obj_type, variant_id)
 
         if obj_type == "sphere":
+            mode = int(variant_id % 3)
+            if mode == 0:
+                # original killer: light/deep blue + circle/ellipse
+                return (
+                    {"kind": "circle", "color": "light_blue", "base_r": 46, "material": "metal"},
+                    {"kind": "ellipse", "color": "deep_blue", "base_r": 46, "material": "metal"},
+                )
+            if mode == 1:
+                # semantic-close colors (red vs orange), same shape
+                return (
+                    {"kind": "sphere", "color": "red", "base_r": 46, "material": "metal"},
+                    {"kind": "sphere", "color": "orange", "base_r": 46, "material": "metal"},
+                )
+            # mode == 2
+            # same color, subtle geometry (circle vs slight-ellipse) to force binding over classification
             return (
-                {"kind": "circle", "color": "light_blue", "base_r": 46},
-                {"kind": "ellipse", "color": "deep_blue", "base_r": 46},
+                {"kind": "circle", "color": "yellow", "base_r": 46, "material": "plastic"},
+                {"kind": "ellipse", "color": "yellow", "base_r": 46, "material": "plastic"},
             )
 
-        # structured version keeps the same *color difficulty* but swaps the *shape cue* to structured forms
-        # this preserves the 4×2×2×15 factorization integrity (attribute covers structured too).
-        if (variant_id % 2) == 0:
-            angle = float(rng.uniform(-25, 25))
+        # structured: rotate between (prism vs cube), (thin vs thick arrow), (material ambiguity)
+        mode = int(variant_id % 3)
+        angle = float(rng.uniform(-25, 25))
+
+        if mode == 0:
             return (
-                {"kind": "prism", "color": "light_blue", "base_r": 46, "aspect": (1.20, 0.85), "angle": angle},
-                {"kind": "cube", "color": "deep_blue", "base_r": 46, "aspect": (1.00, 1.00), "angle": angle},
+                {"kind": "prism", "color": "light_blue", "base_r": 46, "aspect": (1.18, 0.88), "angle": angle, "material": "metal"},
+                {"kind": "cube", "color": "deep_blue", "base_r": 46, "aspect": (1.00, 1.00), "angle": angle, "material": "metal"},
             )
-        else:
+        if mode == 1:
             angle = float(rng.uniform(-30, 30))
             return (
-                {"kind": "arrow", "color": "light_blue", "base_r": 46, "angle": angle, "thickness": 0.70},
-                {"kind": "arrow", "color": "deep_blue", "base_r": 46, "angle": angle, "thickness": 1.00},
+                {"kind": "arrow", "color": "light_blue", "base_r": 46, "angle": angle, "thickness": 0.78, "material": "plastic"},
+                {"kind": "arrow", "color": "deep_blue", "base_r": 46, "angle": angle, "thickness": 1.00, "material": "plastic"},
             )
+
+        # mode == 2: CLIP-level ambiguity: same color, same shape, only material differs
+        same_c = str(rng.choice(["blue", "purple", "orange"]))
+        return (
+            {"kind": "cube", "color": same_c, "base_r": 46, "aspect": (1.00, 1.00), "angle": angle, "material": "metal"},
+            {"kind": "cube", "color": same_c, "base_r": 46, "aspect": (1.00, 1.00), "angle": -angle, "material": "plastic"},
+        )
 
     rng = seeded_rng("objs", task, obj_type, case_id)
 
@@ -994,10 +1079,33 @@ def shape_phrase(spec: Dict, rng: np.random.Generator) -> str:
     return str(rng.choice(["arrow", "dart"]))
 
 
+def material_phrase(spec: Dict) -> str:
+    m = spec.get("material", None)
+    if m is None:
+        return ""
+    if m == "metal":
+        return "metal"
+    if m == "plastic":
+        return "plastic"
+    return str(m)
+
+
 def build_prompt(task: str, bg_variant: str, objA: Dict, objB: Dict, case_id: int) -> str:
     rng = seeded_rng("prompt", case_id)
-    sA = f"{color_word(objA['color'])} {rng.choice(STYLE_WORDS)} {shape_phrase(objA, rng)}"
-    sB = f"{color_word(objB['color'])} {rng.choice(STYLE_WORDS)} {shape_phrase(objB, rng)}"
+
+    mA = material_phrase(objA)
+    mB = material_phrase(objB)
+
+    # Put material near the noun (CLIP-level ambiguity), but avoid awkward duplicates like "metallic metal".
+    styleA = str(rng.choice(STYLE_WORDS))
+    styleB = str(rng.choice(STYLE_WORDS))
+    if styleA == "metallic" and mA == "metal":
+        mA = ""
+    if styleB == "metallic" and mB == "metal":
+        mB = ""
+
+    sA = f"{color_word(objA['color'])} {styleA} {mA + ' ' if mA else ''}{shape_phrase(objA, rng)}".strip()
+    sB = f"{color_word(objB['color'])} {styleB} {mB + ' ' if mB else ''}{shape_phrase(objB, rng)}".strip()
 
     return (
         f"Object A: {sA}.\n"
@@ -1021,6 +1129,8 @@ def generate_dataset(
     smooth_window: int = 4,
     same_color_ratio: float = 0.30,
     record_motion_stats: bool = True,
+    min_separation_px: float = 3.0,
+    track_noise_std: float = 0.006,
 ):
     if attribute_variants is None:
         attribute_variants = n_variants
@@ -1082,6 +1192,8 @@ def generate_dataset(
                         stress_mode=stress_mode,
                         overlap_frames=overlap_frames,
                         smooth_window=smooth_window,
+                        min_separation_px=min_separation_px,
+                        track_noise_std=track_noise_std,
                     )
                     objA, objB = object_specs(task, obj_type, case_id, variant_id)
 
@@ -1237,6 +1349,18 @@ def _parse_args():
         default=4,
         help="ramp frames for overlap events. 0=teleport, 4=default smooth. Useful to separate discontinuity vs binding failures.",
     )
+    p.add_argument(
+        "--min_separation_px",
+        type=float,
+        default=3.0,
+        help="In non-hard occlusion, keep a tiny separation (>= this many pixels) to avoid ill-posed multi-frame perfect merges.",
+    )
+    p.add_argument(
+        "--track_noise_std",
+        type=float,
+        default=0.006,
+        help="Extra low-frequency noise std (normalized units) to break perfect symmetry. Suggest 0.006~0.012.",
+    )
 
     # Color diversity control
     p.add_argument(
@@ -1282,4 +1406,6 @@ if __name__ == "__main__":
         smooth_window=args.smooth_window,
         same_color_ratio=args.same_color_ratio,
         record_motion_stats=(not args.no_motion_stats),
+        min_separation_px=args.min_separation_px,
+        track_noise_std=args.track_noise_std,
     )
